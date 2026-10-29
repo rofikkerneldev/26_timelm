@@ -1,0 +1,423 @@
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+index 3d9c06a..f974c63 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -1,8 +1,12 @@
+ /*
+- * SWEET kernels run on two Xiaomi phones. The ADT root compatible
++ * SWEET kernels run on three phones. The ADT root compatible
+  * (tools/mkadt.py --board) names the board; everything else is common.
+  *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
+  *   xiaomi,beryllium  Poco F1, SDM845
++ *   lg,timelm         LG V60 ThinQ (timelm), SM8250: ARMv8.2 like the
++ *                     others, but Aff0 = core, Aff1 = 0 (kona numbering),
++ *                     virtual timer INTID 27 (the ADT records it), EPSS
++ *                     cpufreq with three domains (Silver/Gold/Prime).
+  */
+ #ifndef _SWEET_BOARD_H_
+ #define _SWEET_BOARD_H_
+@@ -76,4 +80,14 @@ sweet_board_beryllium(void)
+ 	return cached == 1;
+ }
+ 
++static inline bool
++sweet_board_timelm(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("lg,timelm") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
+ #endif /* _SWEET_BOARD_H_ */
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 2460e6d..857f505 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -115,7 +115,7 @@ void sweet_input_boost(void);
+ #define CPUFREQ_PERF_STATE      0x920u
+ #define CPUFREQ_LUT_ROW         0x20u
+ #define CPUFREQ_WINDOW          0x1400u
+-#define CPUFREQ_LUT_MAX         27u     /* qcom,lut-max-entries in the live DT */
++#define CPUFREQ_LUT_MAX         40u     /* mainline LUT_MAX_ENTRIES (EPSS allows 40 rows) */
+ #define CPUFREQ_XO_KHZ          19200u
+ #define CPUFREQ_ALT_KHZ         300000u /* source 0: GPLL0 / 2 */
+ #define CPUFREQ_UP_WAIT_S       120
+@@ -139,6 +139,8 @@ static struct cf_domain {
+ 	unsigned first_cpu;             /* lowest logical CPU of the cluster */
+ 	unsigned ncpu;
+ 	int percent;                    /* fixed target or gov cap, % of max */
++	/* Register map: cpufreq-hw (SM7150/SDM845) vs EPSS (SM8250), filled per board. */
++	uint32_t lut_off, vlut_off, ps_off, row;
+ 	vm_offset_t base;
+ 	int state;
+ 	uint32_t n;
+@@ -158,11 +160,55 @@ static struct cf_domain {
+ 	uint64_t tis_ns[CPUFREQ_LUT_MAX];
+ 	uint64_t tis_snap[CPUFREQ_LUT_MAX];
+ 	uint64_t prev_idle[4];
+-} cf_dom[2] = {
+-	{ "A55", "0-3", 0x17d43000u, 0, 4, 50 },
+-	{ "A75", "4-7", 0x17d45800u, 4, 4, 100 },
++} cf_dom[3] = {
++	{ "A55", "0-3", 0x17d43000u, 0, 4, 50,
++	  CPUFREQ_FREQ_LUT, CPUFREQ_VOLT_LUT, CPUFREQ_PERF_STATE, CPUFREQ_LUT_ROW },
++	{ "A75", "4-7", 0x17d45800u, 4, 4, 100,
++	  CPUFREQ_FREQ_LUT, CPUFREQ_VOLT_LUT, CPUFREQ_PERF_STATE, CPUFREQ_LUT_ROW },
++	/* Third domain (timelm/SM8250 only, cf_ndom keeps it unused elsewhere). */
++	{ "Prime", "7", 0x18593000u, 7, 1, 100,
++	  0x100u, 0x200u, 0x320u, 4u },
+ };
+ 
++/* Domains in use: 2 (SM7150/SDM845), 3 on timelm/SM8250. */
++static unsigned cf_ndom = 2;
++
++/*
++ * SM8250 (timelm): three EPSS frequency domains, cpufreq@18591000 in the live DT
++ * (freq-domain0 0x18591000, freq-domain1 0x18592000, freq-domain2 0x18593000).
++ * EPSS register map is the mainline epss_soc_data (qcom-cpufreq-hw.c): FREQ_LUT
++ * 0x100, VOLT_LUT 0x200, PERF_STATE 0x320, 4-byte rows; the row's bit layout
++ * (src 31:30, core count 18:16, lval 7:0) is the same as cpufreq-hw's first word.
++ */
++static void
++cf_board_init(void)
++{
++	if (!sweet_board_timelm()) {
++		return;
++	}
++	static const struct {
++		const char *name, *cpus;
++		vm_offset_t pa;
++		unsigned first, ncpu;
++	} sm8250[3] = {
++		{ "Silver", "0-3", 0x18591000u, 0, 4 },
++		{ "Gold", "4-6", 0x18592000u, 4, 3 },
++		{ "Prime", "7", 0x18593000u, 7, 1 },
++	};
++	cf_ndom = 3;
++	for (unsigned i = 0; i < 3; i++) {
++		cf_dom[i].name = sm8250[i].name;
++		cf_dom[i].cpus = sm8250[i].cpus;
++		cf_dom[i].pa = sm8250[i].pa;
++		cf_dom[i].first_cpu = sm8250[i].first;
++		cf_dom[i].ncpu = sm8250[i].ncpu;
++		cf_dom[i].lut_off = 0x100u;
++		cf_dom[i].vlut_off = 0x200u;
++		cf_dom[i].ps_off = 0x320u;
++		cf_dom[i].row = 4u;
++	}
++}
++
+ static bool cf_started;
+ static int cf_mode = MODE_OFF;
+ static unsigned cf_ncpus;
+@@ -216,7 +262,7 @@ static void
+ cf_request(struct cf_domain *d, uint32_t idx)
+ {
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(d->base + CPUFREQ_PERF_STATE) = idx;
++	*(volatile uint32_t *)(d->base + d->ps_off) = idx;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	d->req = idx;
+ 	d->changes++;
+@@ -231,8 +277,8 @@ cf_read_lut(unsigned id, struct cf_domain *d)
+ 
+ 	d->n = 0;
+ 	for (uint32_t i = 0; i < CPUFREQ_LUT_MAX; i++) {
+-		uint32_t row = cf_rd(d, CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
+-		uint32_t volt = cf_rd(d, CPUFREQ_VOLT_LUT + i * CPUFREQ_LUT_ROW);
++		uint32_t row = cf_rd(d, d->lut_off + i * d->row);
++		uint32_t volt = cf_rd(d, d->vlut_off + i * d->row);
+ 		if (row == 0xffffffffu) {
+ 			printf("SWEET CPUFREQ: domain %u: LUT row %u reads all-ones (block not clocked?)\n", id, i);
+ 			d->n = 0;
+@@ -284,11 +330,11 @@ static void
+ cf_readback(unsigned id, struct cf_domain *d, uint32_t idx)
+ {
+ 	unsigned waited = 0;
+-	uint32_t now = cf_rd(d, CPUFREQ_PERF_STATE);
++	uint32_t now = cf_rd(d, d->ps_off);
+ 	while (now != idx && waited < 50) {
+ 		cf_sleep_ms(1);
+ 		waited++;
+-		now = cf_rd(d, CPUFREQ_PERF_STATE);
++		now = cf_rd(d, d->ps_off);
+ 	}
+ 	printf("SWEET CPUFREQ: domain %u: readback perf state %u (%u kHz) after %u ms: %s\n",
+ 	    id, now, cf_state_khz(d, now), waited,
+@@ -317,7 +363,7 @@ cf_setup(unsigned id, struct cf_domain *d)
+ 		    "not touching it (sweetcpufreq_force=1 forces)\n", id);
+ 		return;
+ 	}
+-	uint32_t old = cf_rd(d, CPUFREQ_PERF_STATE);
++	uint32_t old = cf_rd(d, d->ps_off);
+ 	printf("SWEET CPUFREQ: domain %u: current perf state %u (%u kHz)\n", id, old, cf_state_khz(d, old));
+ 	d->cap = cf_pick(d, d->percent);
+ 	printf("SWEET CPUFREQ: domain %u: %s %d%% of max -> perf state %u (%u kHz)\n", id,
+@@ -370,7 +416,7 @@ cf_cluster_load(struct cf_domain *d, uint64_t wall)
+ static void
+ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ {
+-	uint32_t cur = cf_rd(d, CPUFREQ_PERF_STATE);
++	uint32_t cur = cf_rd(d, d->ps_off);
+ 	if (cur >= d->n) {
+ 		cur = d->req;
+ 	}
+@@ -475,9 +521,9 @@ sweet_input_boost(void)
+ 	if (cf_mode != MODE_GOV || !cf_in_khz) {
+ 		return;
+ 	}
+-	for (unsigned i = 0; i < 2; i++) {
++	for (unsigned i = 0; i < cf_ndom; i++) {
+ 		struct cf_domain *d = &cf_dom[i];
+-		if (d->state == CF_APPLIED && cf_rd(d, CPUFREQ_PERF_STATE) < d->in_idx) {
++		if (d->state == CF_APPLIED && cf_rd(d, d->ps_off) < d->in_idx) {
+ 			cf_request(d, d->in_idx);
+ 		}
+ 	}
+@@ -508,7 +554,10 @@ cf_amp_setup(void)
+ 	uint64_t big = 0, little = 0;
+ 
+ 	for (unsigned i = 0; i < topo->num_cpus && i < 8; i++) {
+-		if (topo->cpus[i].phys_id >= 0x400u) {  /* MPIDR Aff1 4-7: Cortex-A75 */
++		/* Core class by MPIDR: sweet/beryllium Aff1 4-7 (Gold), timelm Aff0 4-7. */
++		uint32_t const core = sweet_board_timelm() ?
++		    (topo->cpus[i].phys_id & 0xffu) : ((topo->cpus[i].phys_id >> 8) & 0xffu);
++		if (core >= 4u) {
+ 			big |= 1ULL << topo->cpus[i].cpu_id;
+ 		} else {
+ 			little |= 1ULL << topo->cpus[i].cpu_id;
+@@ -544,7 +593,9 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		if (t == CPUFREQ_UP_WAIT_S * 10 - 1) {
+ 			printf("SWEET CPUFREQ: only %u/%u CPUs up after %d s, leaving the frequencies alone\n",
+ 			    up, cf_ncpus, CPUFREQ_UP_WAIT_S);
+-			cf_dom[0].state = cf_dom[1].state = CF_SKIPPED;
++			for (unsigned d2 = 0; d2 < cf_ndom; d2++) {
++				cf_dom[d2].state = CF_SKIPPED;
++			}
+ 			goto out;
+ 		}
+ 		cf_sleep_ms(100);
+@@ -556,18 +607,23 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		goto out;
+ 	}
+ 	printf("SWEET CPUFREQ: %u CPUs up; mode %s; A55 %d%%, A75 %d%% of max\n", cf_ncpus,
+-	    cf_mode == MODE_GOV ? "gov" : "fixed", cf_dom[0].percent, cf_dom[1].percent);
+-	for (unsigned i = 0; i < 2; i++) {
++	    cf_mode == MODE_GOV ? "gov" : "fixed",
++	    cf_dom[0].percent, cf_dom[cf_ndom - 1].percent);
++	for (unsigned i = 0; i < cf_ndom; i++) {
+ 		cf_setup(i, &cf_dom[i]);
+ 	}
+-	if (cf_dom[0].state != CF_APPLIED && cf_dom[1].state != CF_APPLIED) {
++	bool any_applied = false;
++	for (unsigned d2 = 0; d2 < cf_ndom; d2++) {
++		any_applied = any_applied || cf_dom[d2].state == CF_APPLIED;
++	}
++	if (!any_applied) {
+ 		goto out;
+ 	}
+ 
+ 	/* Accounting loop (also in fixed mode, slower): time-in-state, load, governor. */
+ 	unsigned period = cf_mode == MODE_GOV ? GOV_PERIOD_MS : FIXED_PERIOD_MS;
+ 	uint64_t last = mach_absolute_time(), last_log = last;
+-	for (unsigned i = 0; i < 2; i++) {
++	for (unsigned i = 0; i < cf_ndom; i++) {
+ 		(void)cf_cluster_load(&cf_dom[i], 1);   /* prime prev_idle */
+ 	}
+ 	for (;;) {
+@@ -576,12 +632,12 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		uint64_t wall = now - last, wall_ns;
+ 		last = now;
+ 		absolutetime_to_nanoseconds(wall, &wall_ns);
+-		for (unsigned i = 0; i < 2; i++) {
++		for (unsigned i = 0; i < cf_ndom; i++) {
+ 			struct cf_domain *d = &cf_dom[i];
+ 			if (d->state != CF_APPLIED) {
+ 				continue;
+ 			}
+-			uint32_t cur = cf_rd(d, CPUFREQ_PERF_STATE);
++			uint32_t cur = cf_rd(d, d->ps_off);
+ 			if (cur < d->n) {
+ 				d->tis_ns[cur] += wall_ns;      /* the state held during this interval */
+ 			}
+@@ -591,7 +647,7 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		absolutetime_to_nanoseconds(now - last_log, &since_log_ns);
+ 		if (cf_log_secs && since_log_ns >= (uint64_t)cf_log_secs * NSEC_PER_SEC) {
+ 			last_log = now;
+-			for (unsigned i = 0; i < 2; i++) {
++			for (unsigned i = 0; i < cf_ndom; i++) {
+ 				if (cf_dom[i].state == CF_APPLIED) {
+ 					cf_log_summary(i, &cf_dom[i]);
+ 				}
+@@ -621,12 +677,13 @@ sweet_cpufreq_max(void)
+ 	char arg[16] = "gov";
+ 	thread_t thread;
+ 
+-	if (!sweet_board_beryllium() || cf_started) {
++	if (cf_started || (!sweet_board_beryllium() && !sweet_board_timelm())) {
+ 		return;
+ 	}
+ 	cf_started = true;
++	cf_board_init();
+ 	{
+-		int on = 1, ms = 300, khz = 1766400;
++		int on = 1, ms = 300, khz = sweet_board_timelm() ? 1804800 : 1766400;
+ 
+ 		(void)PE_parse_boot_argn("sweetinputboost", &on, sizeof(on));
+ 		(void)PE_parse_boot_argn("sweetgpuinputms", &ms, sizeof(ms));
+@@ -645,7 +702,9 @@ sweet_cpufreq_max(void)
+ 	(void)PE_parse_boot_argn("sweetamp_prio", &cf_amp_pri, sizeof(cf_amp_pri));
+ 	if (!strcmp(arg, "off") || !strcmp(arg, "0")) {
+ 		cf_mode = MODE_OFF;
+-		cf_dom[0].state = cf_dom[1].state = CF_OFF;
++		for (unsigned d2 = 0; d2 < cf_ndom; d2++) {
++			cf_dom[d2].state = CF_OFF;
++		}
+ 		printf("SWEET CPUFREQ: off (sweetcpufreq=%s), frequencies left as the firmware set them\n", arg);
+ 		if (cf_amp) {
+ 			goto start;     /* the thread only does the core steering */
+@@ -655,14 +714,14 @@ sweet_cpufreq_max(void)
+ 	if (!strcmp(arg, "fixed")) {
+ 		cf_mode = MODE_FIXED;
+ 		cf_dom[0].percent = cf_percent_arg("sweetcpufreq_little", 40);
+-		cf_dom[1].percent = cf_percent_arg("sweetcpufreq_big", 100);
++		cf_dom[cf_ndom - 1].percent = cf_percent_arg("sweetcpufreq_big", 100);
+ 	} else {
+ 		if (strcmp(arg, "gov") && strcmp(arg, "1")) {
+ 			printf("SWEET CPUFREQ: unknown sweetcpufreq=%s, using gov\n", arg);
+ 		}
+ 		cf_mode = MODE_GOV;
+ 		cf_dom[0].percent = cf_percent_arg("sweetcpufreq_little_max", 50);
+-		cf_dom[1].percent = cf_percent_arg("sweetcpufreq_big_max", 100);
++		cf_dom[cf_ndom - 1].percent = cf_percent_arg("sweetcpufreq_big_max", 100);
+ 	}
+ 	int v = 10;
+ 	(void)PE_parse_boot_argn("sweetcpufreq_log", &v, sizeof(v));
+@@ -707,12 +766,12 @@ cf_sysctl SYSCTL_HANDLER_ARGS
+ 	    cf_amp_on ? "on" : "off", cf_amp_big, cf_amp_pri,
+ 	    cf_in_hold_abs ? "on" : "off", cf_in_khz, cf_in_ms, cf_in_events,
+ 	    (unsigned)(cf_in_hold_abs && mach_absolute_time() < cf_in_until));
+-	for (unsigned i = 0; i < 2; i++) {
++	for (unsigned i = 0; i < cf_ndom; i++) {
+ 		const struct cf_domain *d = &cf_dom[i];
+ 		const char *st = d->state == CF_OFF ? "off" : d->state == CF_PENDING ? "pending" :
+ 		    d->state == CF_SKIPPED ? "skipped" : "applied";
+ 		bool ok = d->state == CF_APPLIED;
+-		uint32_t cur = ok ? cf_rd(d, CPUFREQ_PERF_STATE) : 0;
++		uint32_t cur = ok ? cf_rd(d, d->ps_off) : 0;
+ 		n = cf_cat(buf, sizeof(buf), n,
+ 		    "cluster%u name=%s cpus=%s state=%s mode=%s idx=%u cur_khz=%u min_khz=%u max_khz=%u cap_khz=%u "
+ 		    "lut_n=%u load=%u changes=%u base_cap_khz=%u lut_khz=", i, d->name, d->cpus, st, modes[cf_mode], cur,
+@@ -743,11 +802,17 @@ void sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz);
+ void
+ sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz)
+ {
+-	unsigned *out[2] = { a55_mhz, a75_mhz };
++	*a75_mhz = 0;
+ 
+-	for (unsigned i = 0; i < 2; i++) {
++	for (unsigned i = 0; i < cf_ndom; i++) {
+ 		const struct cf_domain *d = &cf_dom[i];
+-		*out[i] = d->state == CF_APPLIED ? cf_state_khz(d, cf_rd(d, CPUFREQ_PERF_STATE)) / 1000 : 0;
++		unsigned mhz = d->state == CF_APPLIED ? cf_state_khz(d, cf_rd(d, d->ps_off)) / 1000 : 0;
++		/* Two HUD slots: the little cluster, and the fastest big cluster. */
++		if (i == 0) {
++			*a55_mhz = mhz;
++		} else if (mhz > *a75_mhz) {
++			*a75_mhz = mhz;
++		}
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index d713945..241db17 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -1207,7 +1207,7 @@ out:
+ void
+ sweet_touch_init(void)
+ {
+-	int enabled = 1;
++	int enabled = !sweet_board_timelm();
+ 	thread_t thread;
+ 	if (st.started) {
+ 		return;
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index 3cb72e3..3689742 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -74,6 +74,8 @@ static const struct {
+ #define DWC3_SIZE               0x0000d000
+ #define QUSB2_PA                0x088e2000
+ #define QUSB2_SIZE              0x00000400
++/* timelm/kona: the HS PHY is a Synopsys 7nm one at 0x88e3000 (DT usb-hs-phy),
++ * not a QUSB2 at 0x088e2000; skip the QUSB2 diagnostic read there. */
+ 
+ static uint32_t
+ usb_rd(vm_offset_t base, uint32_t off)
+@@ -133,6 +135,10 @@ sweet_usb_probe(void)
+ 		printf("SWEET USB: ahb2phy clock off; QUSB2 PHY not read\n");
+ 		return;
+ 	}
++	if (sweet_board_timelm()) {
++		printf("SWEET USB: timelm/kona: SNPS 7nm HS PHY at 0x088e3000, QUSB2 diagnostics skipped\n");
++		return;
++	}
+ 	vm_offset_t phy = ml_io_map(QUSB2_PA, QUSB2_SIZE);
+ 	if (phy == 0) {
+ 		return;
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index bed0aa3..78babfe 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -17,6 +17,7 @@
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+ #include <pexpert/pexpert.h>
++#include "../../../bsd/dev/sweet_board.h"
+ 
+ extern "C" void sweet_secondary_entry(void);
+ extern "C" boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+@@ -79,16 +80,23 @@ SweetCPU::start(IOService *provider)
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
+ 		return false;
+ 	}
+-	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+-	if (cpu->phys_id > 0x700 || (cpu->phys_id & 0xff) != 0 ||
+-	    topology->num_cpus > SWEET_SMP_MAX_CPUS) {
++	/*
++	 * MPIDR, board-dependent: sweet/beryllium put the core in Aff1
++	 * (0x000-0x500 A55, 0x600/0x700 A76; Aff0 = 0), kona/SM8250 puts it in
++	 * Aff0 (0x000-0x007, Aff1 = 0). Either way one homogeneous ARMv8.2
++	 * cluster, boot core MPIDR 0, ascending nodes.
++	 */
++	uint32_t const aff0 = cpu->phys_id & 0xff, aff1 = (cpu->phys_id >> 8) & 0xff;
++	if (cpu->phys_id > 0x700 || topology->num_cpus > SWEET_SMP_MAX_CPUS ||
++	    (sweet_board_timelm() ? (aff1 != 0 || aff0 >= topology->num_cpus)
++	                          : (aff0 != 0 || aff1 >= topology->num_cpus))) {
+ 		panic("SWEET CPU: invalid topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+ 	}
+ 	if (!IOCPU::start(provider)) {
+ 		return false;
+ 	}
+-	cpuName = OSSymbol::withCStringNoCopy("Kryo 470");
++	cpuName = OSSymbol::withCStringNoCopy(sweet_board_timelm() ? "Kryo 485" : "Kryo 470");
+ 	if (cpuName == NULL) {
+ 		return false;
+ 	}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index c4fdd55..22a6182 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -38,7 +38,7 @@ const char * gIOKernelConfigTables =
+     "   {"
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+-    "     'IONameMatch'     = 'xiaomi,sweet';"
++    "     'IONameMatch'     = 'xiaomi,sweet' 'lg,timelm';"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
