@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index c6d113f..c291eda 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -12,6 +12,7 @@
+ 
+ extern "C" int sweet_reboot_restart(int panic_restart);
+ extern "C" void sweet_reboot_note_panic(void);
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include "../../../bsd/dev/sweet_board.h"
+ #include "../../../bsd/dev/sweet_spmi.h"
+ 
+@@ -42,6 +43,24 @@ SweetPlatformExpert::start(IOService *provider)
+ 	if (sweet_board_beryllium()) {
+ 		publishResource("IORTC");       /* 0245: the PM8998 RTC below; IOKitInitializeTime waits up to 30 s for it */
+ 	}
++	if (sweet_board_timelm()) {
++		/*
++		 * LG V60 (timelm, SM8250): the APSS watchdog at 0x17c10000
++		 * (qcom,apss-wdt-sm8250 / kpss-wdt) is re-armed by TZ after the
++		 * enxerto one-shot EN clear - a ~120 s secure-side bite resets the
++		 * SoC mid-boot with no panic (the bite survives past the non-secure
++		 * EN bit). Re-assert the full disarm inside the kernel: EN off,
++		 * clear any pending bark interrupt, reload the counter.
++		 */
++		volatile uint32_t *w = (volatile uint32_t *)ml_io_map(0x17c10000, 0x1000);
++		if (w) {
++			w[0x08 / 4] = 0;            /* EN */
++			w[0x0c / 4] = 0xffffffffu;  /* CLR: clear bark irq */
++			w[0x04 / 4] = 1;            /* RST: reload counter */
++			__sync_synchronize();
++			IOLog("TIMELM: APSS WDT re-disabled in kernel (EN=0 CLR=all)\n");
++		}
++	}
+ 	return true;
+ }
+ 
